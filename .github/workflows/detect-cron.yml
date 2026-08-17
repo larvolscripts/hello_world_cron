@@ -77,3 +77,22 @@ jobs:
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push changed cron images
+        shell: bash
+        run: |
+          for CRON in ${{ steps.detect.outputs.crons }}; do
+            echo "Building $CRON"
+
+            ECR_REPO="229531317968.dkr.ecr.us-east-1.amazonaws.com/central-cron/$CRON"
+
+            docker build \
+              -t "$ECR_REPO:${GITHUB_SHA}" \
+              -t "$ECR_REPO:latest" \
+              "tasks/$CRON"
+
+            docker push "$ECR_REPO:${GITHUB_SHA}"
+            docker push "$ECR_REPO:latest"
+
+            echo "Successfully pushed $CRON"
+          done
