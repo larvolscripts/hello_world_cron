@@ -1,0 +1,36 @@
+name: Detect Changed Cron
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "tasks/**"
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed cron folders
+        run: |
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          CRONS=$(echo "$CHANGED_FILES" \
+            | grep '^tasks/' \
+            | cut -d/ -f2 \
+            | sort -u)
+
+          echo "Changed cron jobs:"
+
+          for CRON in $CRONS; do
+            echo "Changed cron: $CRON"
+          done
