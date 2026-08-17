@@ -1,4 +1,4 @@
-name: Detect Changed Cron
+name: Build Changed Cron
 
 on:
   push:
@@ -7,8 +7,16 @@ on:
     paths:
       - "tasks/**"
 
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "229531317968"
+
 jobs:
-  detect:
+  detect-and-build:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,6 +26,8 @@ jobs:
           fetch-depth: 2
 
       - name: Detect changed cron folders
+        id: detect
+        shell: bash
         run: |
           CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
 
@@ -30,7 +40,35 @@ jobs:
             | sort -u)
 
           echo "Changed cron jobs:"
+          echo "$CRONS"
 
-          for CRON in $CRONS; do
-            echo "Changed cron: $CRON"
+          echo "crons=$CRONS" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::229531317968:role/github-central-cron-role
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push changed cron images
+        shell: bash
+        run: |
+          for CRON in ${{ steps.detect.outputs.crons }}; do
+
+            echo "Building $CRON"
+
+            ECR_REPO="229531317968.dkr.ecr.us-east-1.amazonaws.com/central-cron/$CRON"
+
+            docker build \
+              -t "$ECR_REPO:${GITHUB_SHA}" \
+              -t "$ECR_REPO:latest" \
+              "tasks/$CRON"
+
+            docker push "$ECR_REPO:${GITHUB_SHA}"
+            docker push "$ECR_REPO:latest"
+
+            echo "Successfully pushed $CRON"
           done
