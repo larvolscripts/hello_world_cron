@@ -47,7 +47,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
-          role-to-assume: arn:aws:iam::229531317968:role/github-central-cron-role
+          role-to-assume: arn:aws:iam::229531317968:role/central-cron-deploy-role
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
@@ -57,7 +57,6 @@ jobs:
         shell: bash
         run: |
           for CRON in ${{ steps.detect.outputs.crons }}; do
-
             echo "Building $CRON"
 
             ECR_REPO="229531317968.dkr.ecr.us-east-1.amazonaws.com/central-cron/$CRON"
