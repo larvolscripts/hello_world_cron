@@ -7,3 +7,4 @@ print("cron1 completed successfully")# test change
 # oidc retry after trust fix
 # new role test
 # oidc debug test
+# ecr push test
