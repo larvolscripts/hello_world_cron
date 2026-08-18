@@ -144,7 +144,7 @@ jobs:
               --cluster "$ECS_CLUSTER" \
               --launch-type FARGATE \
               --task-definition "$TASK_DEF_ARN" \
-              --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET],securityGroups=[$ECS_SECURITY_GROUP],assignPublicIp=DISABLED}"
+              --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET],securityGroups=[$ECS_SECURITY_GROUP],assignPublicIp=ENABLED}"
 
             echo "$CRON deployed and started successfully."
           done
