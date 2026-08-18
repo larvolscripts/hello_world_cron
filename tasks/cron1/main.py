@@ -9,3 +9,4 @@ print("cron1 completed successfully")# test change
 # oidc debug test
 # ecr push test
 # dynamic ecs test
+# retry after public ip fix
