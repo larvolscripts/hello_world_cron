@@ -1,4 +1,4 @@
-name: Build Changed Cron
+name: Build And Run Changed Cron
 
 on:
   push:
@@ -11,8 +11,17 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "229531317968"
+  ECS_CLUSTER: central-cron-cluster
+  ECS_EXECUTION_ROLE: arn:aws:iam::229531317968:role/ecsTaskExecutionRole
+  ECS_SUBNET: subnet-02148812e74b20c7c
+  ECS_SECURITY_GROUP: sg-04c206d6d99bfdd2f
+  CLOUDWATCH_LOG_GROUP: /ecs/central-cron
+
 jobs:
-  detect-and-build:
+  detect-and-run:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,6 +29,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
+
+      - name: Install YAML parser
+        run: pip install pyyaml
 
       - name: Detect changed cron folders
         id: detect
@@ -33,41 +45,13 @@ jobs:
           CRONS=$(echo "$CHANGED_FILES" \
             | grep '^tasks/' \
             | cut -d/ -f2 \
-            | sort -u)
+            | sort -u \
+            | tr '\n' ' ')
 
           echo "Changed cron jobs:"
           echo "$CRONS"
 
           echo "crons=$CRONS" >> "$GITHUB_OUTPUT"
-
-      - name: Show GitHub OIDC claims
-        shell: bash
-        run: |
-          RESPONSE=$(curl -sS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
-
-          TOKEN=$(echo "$RESPONSE" | python3 -c \
-            'import json,sys; print(json.load(sys.stdin)["value"])')
-
-          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f2)
-
-          python3 - "$PAYLOAD" <<'PY'
-          import base64
-          import json
-          import sys
-
-          payload = sys.argv[1]
-          payload += "=" * (-len(payload) % 4)
-
-          claims = json.loads(base64.urlsafe_b64decode(payload))
-
-          print("aud =", claims.get("aud"))
-          print("sub =", claims.get("sub"))
-          print("repository =", claims.get("repository"))
-          print("ref =", claims.get("ref"))
-          print("repository_owner =", claims.get("repository_owner"))
-          PY
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -78,13 +62,43 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push changed cron images
+      - name: Build deploy and run changed crons
         shell: bash
         run: |
           for CRON in ${{ steps.detect.outputs.crons }}; do
-            echo "Building $CRON"
 
-            ECR_REPO="229531317968.dkr.ecr.us-east-1.amazonaws.com/central-cron/$CRON"
+            echo "================================="
+            echo "Processing $CRON"
+            echo "================================="
+
+            CPU=$(python3 -c "
+          import yaml
+          config=yaml.safe_load(open('cron-config.yml'))
+          print(config['$CRON']['cpu'])
+          ")
+
+            MEMORY=$(python3 -c "
+          import yaml
+          config=yaml.safe_load(open('cron-config.yml'))
+          print(config['$CRON']['memory'])
+          ")
+
+            echo "CPU: $CPU"
+            echo "Memory: $MEMORY"
+
+            REPO_NAME="central-cron/$CRON"
+            ECR_REPO="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME"
+
+            echo "Checking ECR repository..."
+
+            aws ecr describe-repositories \
+              --repository-names "$REPO_NAME" \
+              --region "$AWS_REGION" >/dev/null 2>&1 || \
+            aws ecr create-repository \
+              --repository-name "$REPO_NAME" \
+              --region "$AWS_REGION"
+
+            echo "Building Docker image..."
 
             docker build \
               -t "$ECR_REPO:${GITHUB_SHA}" \
@@ -94,5 +108,43 @@ jobs:
             docker push "$ECR_REPO:${GITHUB_SHA}"
             docker push "$ECR_REPO:latest"
 
-            echo "Successfully pushed $CRON"
+            echo "Registering ECS task definition..."
+
+            TASK_DEF_ARN=$(aws ecs register-task-definition \
+              --family "central-cron-$CRON" \
+              --requires-compatibilities FARGATE \
+              --network-mode awsvpc \
+              --cpu "$CPU" \
+              --memory "$MEMORY" \
+              --execution-role-arn "$ECS_EXECUTION_ROLE" \
+              --container-definitions "[
+                {
+                  \"name\": \"$CRON\",
+                  \"image\": \"$ECR_REPO:${GITHUB_SHA}\",
+                  \"essential\": true,
+                  \"logConfiguration\": {
+                    \"logDriver\": \"awslogs\",
+                    \"options\": {
+                      \"awslogs-group\": \"$CLOUDWATCH_LOG_GROUP\",
+                      \"awslogs-region\": \"$AWS_REGION\",
+                      \"awslogs-stream-prefix\": \"$CRON\"
+                    }
+                  }
+                }
+              ]" \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text)
+
+            echo "Task definition created:"
+            echo "$TASK_DEF_ARN"
+
+            echo "Running Fargate task..."
+
+            aws ecs run-task \
+              --cluster "$ECS_CLUSTER" \
+              --launch-type FARGATE \
+              --task-definition "$TASK_DEF_ARN" \
+              --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET],securityGroups=[$ECS_SECURITY_GROUP],assignPublicIp=DISABLED}"
+
+            echo "$CRON deployed and started successfully."
           done
