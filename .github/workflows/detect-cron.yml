@@ -37,7 +37,7 @@ jobs:
         id: detect
         shell: bash
         run: |
-          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+          CHANGED_FILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")
 
           echo "Changed files:"
           echo "$CHANGED_FILES"
