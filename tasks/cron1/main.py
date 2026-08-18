@@ -8,3 +8,4 @@ print("cron1 completed successfully")# test change
 # new role test
 # oidc debug test
 # ecr push test
+# dynamic ecs test
