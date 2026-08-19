@@ -7,6 +7,7 @@ on:
     paths:
       - "tasks/**"
       - "cron-config.yml"
+      - ".github/workflows/detect-cron.yml"
 
 permissions:
   id-token: write
@@ -26,7 +27,9 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      crons: ${{ steps.detect.outputs.crons }}
+      code_crons: ${{ steps.detect.outputs.code_crons }}
+      resource_crons: ${{ steps.detect.outputs.resource_crons }}
+      schedule_crons: ${{ steps.detect.outputs.schedule_crons }}
 
     steps:
       - name: Checkout repository
@@ -34,38 +37,124 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect changed cron folders
+      - name: Install YAML parser
+        run: pip install pyyaml
+
+      - name: Detect exact cron changes
         id: detect
         shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
         run: |
-          CHANGED_FILES=$(git diff --name-only \
-            "${{ github.event.before }}" \
-            "${{ github.sha }}")
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+          import yaml
 
-          echo "Changed files:"
-          echo "$CHANGED_FILES"
+          before = os.environ["BEFORE_SHA"]
+          current = os.environ["CURRENT_SHA"]
 
-          CRONS=$(echo "$CHANGED_FILES" \
-            | grep '^tasks/' \
-            | cut -d/ -f2 \
-            | sort -u || true)
+          changed_files = subprocess.check_output(
+              ["git", "diff", "--name-only", before, current],
+              text=True
+          ).splitlines()
 
-          if [ -z "$CRONS" ]; then
-            CRON_JSON="[]"
-          else
-            CRON_JSON=$(printf '%s\n' "$CRONS" | jq -R . | jq -sc .)
-          fi
+          print("Changed files:")
+          for f in changed_files:
+              print(f)
 
-          echo "crons=$CRON_JSON" >> "$GITHUB_OUTPUT"
+          # ----------------------------
+          # Detect code changes
+          # ----------------------------
+          code_crons = set()
 
-  deploy:
+          for path in changed_files:
+              parts = path.split("/")
+
+              if len(parts) >= 2 and parts[0] == "tasks":
+                  code_crons.add(parts[1])
+
+          # ----------------------------
+          # Load new config
+          # ----------------------------
+          with open("cron-config.yml") as f:
+              new_config = yaml.safe_load(f) or {}
+
+          # ----------------------------
+          # Load previous config
+          # ----------------------------
+          try:
+              old_text = subprocess.check_output(
+                  ["git", "show", f"{before}:cron-config.yml"],
+                  text=True,
+                  stderr=subprocess.DEVNULL
+              )
+              old_config = yaml.safe_load(old_text) or {}
+          except subprocess.CalledProcessError:
+              old_config = {}
+
+          resource_changed = set()
+          schedule_changed = set()
+
+          all_crons = set(old_config) | set(new_config)
+
+          for cron in all_crons:
+              old = old_config.get(cron, {}) or {}
+              new = new_config.get(cron, {}) or {}
+
+              # CPU / RAM only
+              if (
+                  old.get("cpu") != new.get("cpu")
+                  or old.get("memory") != new.get("memory")
+              ):
+                  resource_changed.add(cron)
+
+              # Scheduling only
+              if (
+                  old.get("schedule") != new.get("schedule")
+                  or old.get("timezone") != new.get("timezone")
+                  or old.get("enabled") != new.get("enabled")
+              ):
+                  schedule_changed.add(cron)
+
+          # If code changed too, code deployment will already
+          # register the task definition using current CPU/RAM.
+          resource_only = resource_changed - code_crons
+
+          # Only operate on crons still present in current config.
+          code_crons &= set(new_config)
+          resource_only &= set(new_config)
+
+          code_json = json.dumps(sorted(code_crons))
+          resource_json = json.dumps(sorted(resource_only))
+          schedule_json = json.dumps(sorted(schedule_changed))
+
+          print("Code changes:", code_json)
+          print("Resource-only changes:", resource_json)
+          print("Schedule changes:", schedule_json)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"code_crons={code_json}\n")
+              f.write(f"resource_crons={resource_json}\n")
+              f.write(f"schedule_crons={schedule_json}\n")
+          PY
+
+
+  # ============================================================
+  # CODE CHANGE
+  # Build image + push ECR + register new task definition
+  # ============================================================
+
+  deploy-code:
     needs: detect
-    if: needs.detect.outputs.crons != '[]'
+    if: needs.detect.outputs.code_crons != '[]'
 
     strategy:
       fail-fast: false
       matrix:
-        cron: ${{ fromJSON(needs.detect.outputs.crons) }}
+        cron: ${{ fromJSON(needs.detect.outputs.code_crons) }}
 
     runs-on: ubuntu-latest
 
@@ -92,7 +181,7 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and deploy cron
+      - name: Build and deploy changed cron
         shell: bash
         env:
           CRON: ${{ matrix.cron }}
@@ -111,6 +200,9 @@ jobs:
 
           REPO_NAME="central-cron/$CRON"
           ECR_REPO="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME"
+
+          echo "Deploying $CRON"
+          echo "CPU=$CPU MEMORY=$MEMORY"
 
           aws ecr describe-repositories \
             --repository-names "$REPO_NAME" >/dev/null 2>&1 || \
@@ -146,11 +238,106 @@ jobs:
                   }
                 }
               }
-            ]"
+            ]" >/dev/null
 
-          echo "$CRON deployed successfully."
+          echo "$CRON code deployed successfully."
+
+
+  # ============================================================
+  # CPU / RAM CHANGE ONLY
+  # Keep same image, create new task definition revision
+  # ============================================================
+
+  update-resources:
+    needs: detect
+    if: needs.detect.outputs.resource_crons != '[]'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cron: ${{ fromJSON(needs.detect.outputs.resource_crons) }}
+
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: central-cron-${{ matrix.cron }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install YAML parser
+        run: pip install pyyaml
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::229531317968:role/central-cron-deploy-role
+          aws-region: us-east-1
+
+      - name: Update CPU and memory only
+        shell: bash
+        env:
+          CRON: ${{ matrix.cron }}
+        run: |
+          CPU=$(python3 -c "
+          import yaml
+          c=yaml.safe_load(open('cron-config.yml'))
+          print(c['$CRON']['cpu'])
+          ")
+
+          MEMORY=$(python3 -c "
+          import yaml
+          c=yaml.safe_load(open('cron-config.yml'))
+          print(c['$CRON']['memory'])
+          ")
+
+          FAMILY="central-cron-$CRON"
+
+          echo "Updating resources for $CRON"
+          echo "CPU=$CPU MEMORY=$MEMORY"
+          echo "Docker image will NOT be rebuilt."
+
+          aws ecs describe-task-definition \
+            --task-definition "$FAMILY" \
+            --query taskDefinition > old-task-definition.json
+
+          jq \
+            --arg cpu "$CPU" \
+            --arg memory "$MEMORY" \
+            '
+            del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy
+            )
+            | .cpu = $cpu
+            | .memory = $memory
+            ' old-task-definition.json > new-task-definition.json
+
+          aws ecs register-task-definition \
+            --cli-input-json file://new-task-definition.json >/dev/null
+
+          IMAGE=$(jq -r '.containerDefinitions[0].image' new-task-definition.json)
+
+          echo "$CRON resources updated successfully."
+          echo "Existing image reused: $IMAGE"
+
+
+  # ============================================================
+  # SCHEDULE CHANGE ONLY
+  # Create/update/disable EventBridge schedule
+  # ============================================================
 
   sync-schedules:
+    needs: detect
+    if: needs.detect.outputs.schedule_crons != '[]'
+
     runs-on: ubuntu-latest
 
     steps:
@@ -166,36 +353,56 @@ jobs:
           role-to-assume: arn:aws:iam::229531317968:role/central-cron-deploy-role
           aws-region: us-east-1
 
-      - name: Sync EventBridge schedules
+      - name: Sync changed EventBridge schedules
         shell: bash
+        env:
+          SCHEDULE_CRONS: ${{ needs.detect.outputs.schedule_crons }}
         run: |
           python3 <<'PY'
           import json
+          import os
           import subprocess
           import yaml
 
           with open("cron-config.yml") as f:
               config = yaml.safe_load(f) or {}
 
-          for cron, values in config.items():
-              if not values.get("enabled", False):
-                  print(f"{cron}: disabled, skipping")
-                  continue
+          changed = json.loads(os.environ["SCHEDULE_CRONS"])
 
-              schedule = values.get("schedule")
-              timezone = values.get("timezone", "Asia/Kolkata")
+          lambda_arn = os.environ["LAMBDA_ARN"]
+          scheduler_role = os.environ["SCHEDULER_ROLE_ARN"]
 
-              if not schedule:
-                  print(f"{cron}: no schedule, skipping")
-                  continue
-
+          for cron in changed:
               name = f"central-cron-{cron}"
 
-              target = json.dumps({
-                  "Arn": "arn:aws:lambda:us-east-1:229531317968:function:central-cron-launcher",
-                  "RoleArn": "arn:aws:iam::229531317968:role/central-cron-scheduler-role",
-                  "Input": json.dumps({"cron": cron})
-              })
+              values = config.get(cron)
+
+              # Cron removed completely from config
+              if values is None:
+                  exists = subprocess.run(
+                      [
+                          "aws", "scheduler", "get-schedule",
+                          "--name", name,
+                          "--group-name", "default"
+                      ],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL
+                  ).returncode == 0
+
+                  if exists:
+                      print(f"{cron}: removed from config → deleting schedule")
+
+                      subprocess.run([
+                          "aws", "scheduler", "delete-schedule",
+                          "--name", name,
+                          "--group-name", "default"
+                      ], check=True)
+
+                  continue
+
+              enabled = values.get("enabled", False)
+              schedule = values.get("schedule")
+              timezone = values.get("timezone", "Asia/Kolkata")
 
               exists = subprocess.run(
                   [
@@ -207,9 +414,63 @@ jobs:
                   stderr=subprocess.DEVNULL
               ).returncode == 0
 
-              command = "update-schedule" if exists else "create-schedule"
+              # Explicit kill switch
+              if not enabled:
+                  if exists:
+                      current = json.loads(
+                          subprocess.check_output([
+                              "aws", "scheduler", "get-schedule",
+                              "--name", name,
+                              "--group-name", "default"
+                          ], text=True)
+                      )
 
-              print(f"{cron}: {command} → {schedule} ({timezone})")
+                      target = json.dumps(current["Target"])
+
+                      subprocess.run([
+                          "aws", "scheduler", "update-schedule",
+                          "--name", name,
+                          "--group-name", "default",
+                          "--schedule-expression",
+                          current["ScheduleExpression"],
+                          "--schedule-expression-timezone",
+                          current.get(
+                              "ScheduleExpressionTimezone",
+                              "Asia/Kolkata"
+                          ),
+                          "--flexible-time-window",
+                          json.dumps(current["FlexibleTimeWindow"]),
+                          "--target", target,
+                          "--state", "DISABLED"
+                      ], check=True)
+
+                      print(f"{cron}: schedule DISABLED")
+                  else:
+                      print(f"{cron}: disabled and no schedule exists")
+
+                  continue
+
+              if not schedule:
+                  raise RuntimeError(
+                      f"{cron}: enabled=true but schedule is missing"
+                  )
+
+              target = json.dumps({
+                  "Arn": lambda_arn,
+                  "RoleArn": scheduler_role,
+                  "Input": json.dumps({"cron": cron})
+              })
+
+              command = (
+                  "update-schedule"
+                  if exists
+                  else "create-schedule"
+              )
+
+              print(
+                  f"{cron}: {command} "
+                  f"{schedule} timezone={timezone}"
+              )
 
               subprocess.run([
                   "aws", "scheduler", command,
